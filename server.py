@@ -153,7 +153,7 @@ function renderItems(items) {
       attHtml = '<div class="att-section"><span class="att-label">📎</span>';
       for (var j = 0; j < it.attachments.length; j++) {
         var att = it.attachments[j];
-        attHtml += '<a class="att-link" onclick="downloadAtt(event, \'' + esc(att.id) + '\', \'' + esc(att.fileName) + '\', \'' + esc(it.id) + '\')" title="' + esc(att.fileName) + ' (' + formatSize(att.size) + ')">' + esc(att.fileName) + '</a>';
+        attHtml += '<a class="att-link" href="#" data-att-id="' + esc(att.id) + '" data-att-name="' + esc(att.fileName) + '" data-item-id="' + esc(it.id) + '" title="' + esc(att.fileName) + ' (' + formatSize(att.size) + ')">' + esc(att.fileName) + '</a>';
       }
       attHtml += '</div>';
     }
@@ -177,9 +177,19 @@ function formatSize(bytes) {
   return (bytes/(1024*1024)).toFixed(1) + ' MB';
 }
 
-async function downloadAtt(e, attId, fileName, itemId) {
+// Delegated click handler for attachment links (uses data-att-* attributes)
+document.addEventListener('click', function(e) {
+  var link = e.target.closest('.att-link');
+  if (!link) return;
   e.preventDefault();
-  var link = e.target;
+  var attId = link.getAttribute('data-att-id');
+  var fileName = link.getAttribute('data-att-name');
+  var itemId = link.getAttribute('data-item-id');
+  if (!attId || !itemId) return;
+  downloadAtt(link, attId, fileName, itemId);
+});
+
+async function downloadAtt(link, attId, fileName, itemId) {
   var origText = link.textContent;
   link.classList.add('downloading');
   link.textContent = 'downloading...';
