@@ -2,6 +2,7 @@
 
 A minimal single-page frontend for Vaultwarden/Bitwarden.  
 Open → enter master password → see all vault items in a clean table.  
+**Supports attachments** — click to download any file stored in vault items.  
 No organizations, no collections, no browser extensions, no noise.
 
 ## Architecture
@@ -10,9 +11,9 @@ No organizations, no collections, no browser extensions, no noise.
 Browser  ──→  VaultMini (Flask :8090)  ──→  bw CLI  ──→  Vaultwarden API (your server)
 ```
 
-- **server.py**: Flask app serving the HTML page + `/api/items` endpoint
-- **bw CLI**: Bitwarden CLI (authenticates, fetches, decrypts vault items)
-- **Zero state on disk**: `bw` session data goes to a temp directory, cleaned up after each request
+- **server.py**: Flask app serving the HTML page + `/api/items` + `/api/attachment` endpoints
+- **bw CLI**: Bitwarden CLI (authenticates, fetches, decrypts vault items & attachments)
+- **Session model**: Login once, session key held in memory (10 min TTL). Attachment downloads reuse the same session.
 
 ## Prerequisites
 
@@ -127,12 +128,17 @@ Response (200):
 {
   "items": [
     {
+      "id": "abc123...",
       "name": "GitHub",
       "username": "lab-bot",
       "password": "ghp_xxxx",
-      "uri": "https://github.com"
+      "uri": "https://github.com",
+      "attachments": [
+        {"id": "att-1", "fileName": "id_rsa", "size": 3243}
+      ]
     }
-  ]
+  ],
+  "session_token": "a1b2c3..."
 }
 ```
 
@@ -141,11 +147,29 @@ Response (401):
 {"error": "Login failed"}
 ```
 
+**`POST /api/attachment`**
+
+Request:
+```json
+{
+  "session_token": "a1b2c3...",
+  "item_id": "abc123...",
+  "attachment_id": "att-1"
+}
+```
+
+Response (200): Raw file bytes with `Content-Disposition: attachment` header (browser triggers download).
+
+Response (401):
+```json
+{"error": "Session expired. Please refresh."}
+```
+
 ## Important Notes
 
 1. **User must have complete encryption keys.** If the account was only "invited" via admin panel but never completed registration through the web vault, `bw login` will fail with "Failed to decrypt user key" or "Legacy encryption is no longer supported." The account must be fully registered — create it through the normal web vault sign-up flow.
 
-2. **stateless.** Every `/api/items` call does a full `bw login` → `bw list items` → `bw logout` cycle. No sessions persisted.
+2. **Session-based.** `/api/items` logs in and returns a `session_token`. Attachment downloads reuse the same session (10 min TTL). Clicking "Lock" or waiting 10 minutes logs out the session.
 
 3. **No write operations.** This is read-only. You cannot add, edit, or delete vault items through VaultMini.
 

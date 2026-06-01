@@ -1,13 +1,27 @@
 #!/usr/bin/env python3
-"""VaultMini — the simplest possible Vaultwarden frontend. One password, all passwords."""
-import subprocess, json, os, sys, tempfile
-from flask import Flask, request, jsonify, render_template_string
+"""VaultMini — the simplest possible Vaultwarden frontend."""
+import subprocess, json, os, sys, tempfile, time, uuid, mimetypes
+from flask import Flask, request, jsonify, render_template_string, send_file, Response
 
 app = Flask(__name__)
 
 VAULT_URL = "https://vault.404nfound.com"
 BW_PATH = "/home/bruce/.npm-global/bin/bw"
-BW_HOME = tempfile.mkdtemp(prefix="bw_session_")
+
+# In-memory session store: token → {session_key, bw_home, expires}
+SESSIONS = {}
+
+def bw_env(home):
+    env = os.environ.copy()
+    env['HOME'] = home
+    env['BITWARDENCLI_APPDATA_DIR'] = home
+    return env
+
+def cleanup_sessions():
+    now = time.time()
+    expired = [t for t, s in list(SESSIONS.items()) if s['expires'] < now]
+    for t in expired:
+        del SESSIONS[t]
 
 INDEX = """
 <!DOCTYPE html>
@@ -19,7 +33,7 @@ INDEX = """
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0d1117; color: #c9d1d9; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
-  .container { width: 100%; max-width: 640px; padding: 2rem; }
+  .container { width: 100%; max-width: 720px; padding: 2rem; }
   h1 { font-size: 1.5rem; font-weight: 600; color: #58a6ff; margin-bottom: 0.25rem; }
   .sub { color: #8b949e; font-size: 0.85rem; margin-bottom: 1.5rem; }
   .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 1.5rem; }
@@ -33,10 +47,10 @@ INDEX = """
   .error { color: #f85149; font-size: 0.85rem; margin-top: 0.75rem; padding: 0.5rem; background: #1a0b0b; border-radius: 4px; display: none; }
   table { width: 100%; border-collapse: collapse; margin-top: 0.5rem; }
   th { text-align: left; font-size: 0.75rem; color: #8b949e; text-transform: uppercase; letter-spacing: 0.05em; padding: 0.5rem 0.75rem; border-bottom: 1px solid #21262d; }
-  td { padding: 0.6rem 0.75rem; border-bottom: 1px solid #21262d; font-size: 0.9rem; }
+  td { padding: 0.6rem 0.75rem; border-bottom: 1px solid #21262d; font-size: 0.9rem; vertical-align: top; }
   tr:hover td { background: #1c2128; }
   .name-cell { color: #58a6ff; font-weight: 500; }
-  .copy-btn { background: none; border: 1px solid #30363d; color: #8b949e; padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.75rem; cursor: pointer; width: auto; }
+  .copy-btn { background: none; border: 1px solid #30363d; color: #8b949e; padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.75rem; cursor: pointer; width: auto; margin-left: 0.35rem; }
   .copy-btn:hover { border-color: #58a6ff; color: #58a6ff; }
   .copied { border-color: #238636 !important; color: #3fb950 !important; }
   .password-dots { letter-spacing: 0.15em; }
@@ -47,6 +61,11 @@ INDEX = """
   .toolbar .email { color: #8b949e; font-size: 0.8rem; }
   .toolbar button { width: auto; padding: 0.35rem 0.75rem; font-size: 0.8rem; background: #30363d; margin: 0; }
   .toolbar button:hover { background: #484f58; }
+  .att-link { color: #58a6ff; font-size: 0.8rem; text-decoration: none; cursor: pointer; display: inline-block; margin-right: 0.5rem; }
+  .att-link:hover { text-decoration: underline; }
+  .att-link.downloading { color: #8b949e; cursor: wait; text-decoration: none; }
+  .att-section { margin-top: 0.25rem; }
+  .att-section .att-label { color: #484f58; font-size: 0.7rem; margin-right: 0.25rem; }
 </style>
 </head>
 <body>
@@ -65,6 +84,7 @@ INDEX = """
 </div>
 <script>
 var currentEmail = '';
+var sessionToken = '';
 
 async function unlock() {
   var btn = document.getElementById('unlock-btn');
@@ -84,7 +104,8 @@ async function unlock() {
     });
     var data = await res.json();
     if (!res.ok) throw new Error(data.error || 'Unlock failed');
-    
+
+    sessionToken = data.session_token;
     document.getElementById('password').value = '';
     showLoggedIn(email);
     renderItems(data.items);
@@ -97,7 +118,7 @@ async function unlock() {
 }
 
 function showLoggedIn(email) {
-  document.getElementById('login-card').innerHTML = 
+  document.getElementById('login-card').innerHTML =
     '<div class="toolbar">' +
     '<span class="email">' + esc(email) + '</span>' +
     '<button onclick="lock()">Lock</button>' +
@@ -125,8 +146,20 @@ function renderItems(items) {
     var n = esc(it.name || '(none)');
     var u = esc(it.username || '');
     var uri = esc(it.uri || '');
+
+    // Attachments
+    var attHtml = '';
+    if (it.attachments && it.attachments.length > 0) {
+      attHtml = '<div class="att-section"><span class="att-label">📎</span>';
+      for (var j = 0; j < it.attachments.length; j++) {
+        var att = it.attachments[j];
+        attHtml += '<a class="att-link" onclick="downloadAtt(event, \'' + esc(att.id) + '\', \'' + esc(att.fileName) + '\', \'' + esc(it.id) + '\')" title="' + esc(att.fileName) + ' (' + formatSize(att.size) + ')">' + esc(att.fileName) + '</a>';
+      }
+      attHtml += '</div>';
+    }
+
     html += '<tr data-search="' + (it.name||'').toLowerCase() + ' ' + (it.username||'').toLowerCase() + '">' +
-      '<td class="name-cell" title="' + uri + '">' + n + '</td>' +
+      '<td class="name-cell" title="' + uri + '">' + n + attHtml + '</td>' +
       '<td><span class="val">' + u + '</span><button class="copy-btn" onclick="copyFrom(this)">copy</button></td>' +
       '<td><span class="password-dots">********</span><span class="val" style="display:none">' + esc(it.password || '') + '</span>' +
       '<span class="show-hide" onclick="togglePw(this)">show</span>' +
@@ -135,6 +168,53 @@ function renderItems(items) {
   }
   html += '</tbody></table>';
   results.innerHTML = html;
+}
+
+function formatSize(bytes) {
+  if (!bytes) return '0 B';
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024*1024) return (bytes/1024).toFixed(1) + ' KB';
+  return (bytes/(1024*1024)).toFixed(1) + ' MB';
+}
+
+async function downloadAtt(e, attId, fileName, itemId) {
+  e.preventDefault();
+  var link = e.target;
+  var origText = link.textContent;
+  link.classList.add('downloading');
+  link.textContent = 'downloading...';
+
+  try {
+    var res = await fetch('/api/attachment', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        session_token: sessionToken,
+        item_id: itemId,
+        attachment_id: attId
+      })
+    });
+
+    if (!res.ok) {
+      var err = await res.json();
+      throw new Error(err.error || 'Download failed');
+    }
+
+    var blob = await res.blob();
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = fileName;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  } catch(e) {
+    alert('Download failed: ' + e.message);
+  } finally {
+    link.classList.remove('downloading');
+    link.textContent = origText;
+  }
 }
 
 function togglePw(el) {
@@ -184,6 +264,7 @@ async function refresh() {
     });
     var data = await res.json();
     if (!res.ok) throw new Error(data.error || 'Failed');
+    sessionToken = data.session_token;
     document.getElementById('re-password').value = '';
     document.getElementById('results').innerHTML = '';
     renderItems(data.items);
@@ -210,6 +291,7 @@ def index():
 
 @app.route('/api/items', methods=['POST'])
 def api_items():
+    cleanup_sessions()
     data = request.get_json()
     email = data.get('email', '').strip()
     password = data.get('password', '')
@@ -217,9 +299,8 @@ def api_items():
     if not email or not password:
         return jsonify({'error': 'Email and master password required'}), 400
 
-    env = os.environ.copy()
-    env['HOME'] = BW_HOME
-    env['BITWARDENCLI_APPDATA_DIR'] = BW_HOME
+    home = tempfile.mkdtemp(prefix="bw_")
+    env = bw_env(home)
 
     try:
         subprocess.run([BW_PATH, 'config', 'server', VAULT_URL],
@@ -248,15 +329,32 @@ def api_items():
             login = item.get('login', {})
             uris = login.get('uris') or []
             uri = uris[0].get('uri', '') if uris else ''
+
+            atts = item.get('attachments') or []
+            attachments = [{
+                'id': a.get('id', ''),
+                'fileName': a.get('fileName', 'unnamed'),
+                'size': a.get('size', 0),
+            } for a in atts]
+
             simplified.append({
+                'id': item.get('id', ''),
                 'name': item.get('name', ''),
                 'username': login.get('username', ''),
                 'password': login.get('password', ''),
                 'uri': uri,
+                'attachments': attachments,
             })
 
-        subprocess.run([BW_PATH, 'logout'], env=env, capture_output=True, timeout=5)
-        return jsonify({'items': simplified})
+        # Store session for attachment downloads (10 min TTL)
+        token = uuid.uuid4().hex
+        SESSIONS[token] = {
+            'session_key': session_key,
+            'bw_home': home,
+            'expires': time.time() + 600,
+        }
+
+        return jsonify({'items': simplified, 'session_token': token})
 
     except subprocess.TimeoutExpired:
         return jsonify({'error': 'Operation timed out'}), 504
@@ -264,6 +362,82 @@ def api_items():
         return jsonify({'error': 'Invalid response from vault'}), 500
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/attachment', methods=['POST'])
+def api_attachment():
+    cleanup_sessions()
+    data = request.get_json()
+    token = data.get('session_token', '')
+    item_id = data.get('item_id', '')
+    attachment_id = data.get('attachment_id', '')
+
+    if not token or token not in SESSIONS:
+        return jsonify({'error': 'Session expired. Please refresh.'}), 401
+
+    session = SESSIONS[token]
+    env = bw_env(session['bw_home'])
+    env['BW_SESSION'] = session['session_key']
+
+    # Refresh TTL
+    session['expires'] = time.time() + 600
+
+    out_dir = tempfile.mkdtemp(prefix="bw_att_")
+    try:
+        result = subprocess.run(
+            [BW_PATH, 'get', 'attachment', item_id, '--itemid', item_id,
+             '--output', out_dir],
+            env=env, capture_output=True, text=True, timeout=60
+        )
+        if result.returncode != 0:
+            return jsonify({'error': result.stderr.strip() or 'Failed to get attachment'}), 500
+
+        # bw outputs the file as the attachment's original filename in out_dir
+        files = os.listdir(out_dir)
+        if not files:
+            return jsonify({'error': 'No file output from bw'}), 500
+
+        filepath = os.path.join(out_dir, files[0])
+        filename = files[0]
+
+        mime, _ = mimetypes.guess_type(filename)
+        if not mime:
+            mime = 'application/octet-stream'
+
+        def generate():
+            with open(filepath, 'rb') as f:
+                while True:
+                    chunk = f.read(65536)
+                    if not chunk:
+                        break
+                    yield chunk
+            # Clean up after streaming
+            os.unlink(filepath)
+            os.rmdir(out_dir)
+
+        return Response(
+            generate(),
+            mimetype=mime,
+            headers={'Content-Disposition': f'attachment; filename="{filename}"'}
+        )
+
+    except subprocess.TimeoutExpired:
+        return jsonify({'error': 'Attachment download timed out'}), 504
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/lock', methods=['POST'])
+def api_lock():
+    data = request.get_json()
+    token = data.get('session_token', '')
+    if token in SESSIONS:
+        session = SESSIONS.pop(token)
+        env = bw_env(session['bw_home'])
+        env['BW_SESSION'] = session['session_key']
+        subprocess.run([BW_PATH, 'logout'], env=env, capture_output=True, timeout=5)
+    return jsonify({'ok': True})
+
 
 if __name__ == '__main__':
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8090
