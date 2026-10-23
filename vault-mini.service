@@ -1,14 +1,17 @@
 [Unit]
 Description=VaultMini - Minimal Vaultwarden Frontend
-After=network.target docker.service
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
-User=bruce
-WorkingDirectory=/home/bruce/vault-mini
-ExecStart=/home/bruce/.hermes/hermes-agent/venv/bin/python3 /home/bruce/vault-mini/server.py 8090
+# User service: clone into ~/vault-mini and create its .venv first.
+WorkingDirectory=%h/vault-mini
+EnvironmentFile=%h/.config/vault-mini/config.env
+ExecStart=%h/vault-mini/run.sh
 Restart=on-failure
 RestartSec=5
+UMask=0077
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target
