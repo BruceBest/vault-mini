@@ -1,12 +1,63 @@
 #!/usr/bin/env python3
 """VaultMini — the simplest possible Vaultwarden frontend."""
-import subprocess, json, os, sys, tempfile, time, uuid, mimetypes
-from flask import Flask, request, jsonify, render_template_string, send_file, Response
+from io import BytesIO
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from urllib.parse import urlsplit
+from flask import Flask, request, jsonify, render_template_string, send_file
+from werkzeug.exceptions import NotFound
+
+
+def normalize_base_path(value):
+    """Only accept literal URL path segments, never URLs/query strings."""
+    value = value.rstrip('/')
+    if not value:
+        return ''
+    if not re.fullmatch(r'(?:/[A-Za-z0-9_-]+)+', value):
+        raise ValueError('BASE_PATH must be empty or a path such as /mini')
+    return value
+
+
+class PathPrefixMiddleware:
+    """Mount the whole application below a prefix; proxy must retain it."""
+
+    def __init__(self, application, prefix):
+        self.application = application
+        self.prefix = prefix
+
+    def __call__(self, environ, start_response):
+        path = environ.get('PATH_INFO', '/')
+        if self.prefix:
+            if path != self.prefix and not path.startswith(self.prefix + '/'):
+                return NotFound()(environ, start_response)
+            environ['SCRIPT_NAME'] = environ.get('SCRIPT_NAME', '') + self.prefix
+            environ['PATH_INFO'] = path[len(self.prefix):] or '/'
+        return self.application(environ, start_response)
 
 app = Flask(__name__)
 
-VAULT_URL = "https://vault.404nfound.com"
-BW_PATH = "/home/bruce/.npm-global/bin/bw"
+VAULT_URL = os.environ.get('VAULT_URL', '').strip().rstrip('/')
+BW_PATH = os.environ.get('BW_PATH') or shutil.which('bw') or 'bw'
+BASE_PATH = normalize_base_path(os.environ.get('BASE_PATH', ''))
+SESSION_TTL = 600
+app.wsgi_app = PathPrefixMiddleware(app.wsgi_app, BASE_PATH)
+
+
+def validate_runtime():
+    parsed = urlsplit(VAULT_URL)
+    if (parsed.scheme not in ('http', 'https') or not parsed.netloc
+            or parsed.username is not None or parsed.password is not None
+            or parsed.query or parsed.fragment):
+        raise ValueError('Set VAULT_URL to your Vaultwarden HTTP(S) server URL')
+    if not shutil.which(BW_PATH):
+        raise ValueError('bw CLI not found; install it and set BW_PATH or PATH')
 
 # In-memory session store: token → {session_key, bw_home, expires}
 SESSIONS = {}
@@ -15,13 +66,23 @@ def bw_env(home):
     env = os.environ.copy()
     env['HOME'] = home
     env['BITWARDENCLI_APPDATA_DIR'] = home
+    # Do not inherit a different user's CLI session or automatic login secrets.
+    for key in ('BW_SESSION', 'BW_CLIENTID', 'BW_CLIENTSECRET', 'BW_PASSWORD'):
+        env.pop(key, None)
     return env
+
+
+def discard_session(token):
+    session = SESSIONS.pop(token, None)
+    if session:
+        shutil.rmtree(session['bw_home'], ignore_errors=True)
+
 
 def cleanup_sessions():
     now = time.time()
     expired = [t for t, s in list(SESSIONS.items()) if s['expires'] < now]
     for t in expired:
-        del SESSIONS[t]
+        discard_session(t)
 
 INDEX = """
 <!DOCTYPE html>
@@ -71,7 +132,7 @@ INDEX = """
 <body>
 <div class="container">
   <h1>VaultMini</h1>
-  <p class="sub">vault.404nfound.com</p>
+  <p class="sub">{{ vault_url }}</p>
   <div class="card" id="login-card">
     <label for="email">Email</label>
     <input type="email" id="email" autocomplete="username" placeholder="your@email.com">
@@ -85,6 +146,9 @@ INDEX = """
 <script>
 var currentEmail = '';
 var sessionToken = '';
+var apiItems = {{ url_for('api_items') | tojson }};
+var apiAttachment = {{ url_for('api_attachment') | tojson }};
+var apiLock = {{ url_for('api_lock') | tojson }};
 
 async function unlock() {
   var btn = document.getElementById('unlock-btn');
@@ -97,7 +161,7 @@ async function unlock() {
     var password = document.getElementById('password').value;
     currentEmail = email;
 
-    var res = await fetch('/api/items', {
+    var res = await fetch(apiItems, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({email: email, password: password})
@@ -158,7 +222,7 @@ function renderItems(items) {
       attHtml += '</div>';
     }
 
-    html += '<tr data-search="' + (it.name||'').toLowerCase() + ' ' + (it.username||'').toLowerCase() + '">' +
+    html += '<tr data-search="' + esc(((it.name||'') + ' ' + (it.username||'')).toLowerCase()) + '">' +
       '<td class="name-cell" title="' + uri + '">' + n + attHtml + '</td>' +
       '<td><span class="val">' + u + '</span><button class="copy-btn" onclick="copyFrom(this)">copy</button></td>' +
       '<td><span class="password-dots">********</span><span class="val" style="display:none">' + esc(it.password || '') + '</span>' +
@@ -195,7 +259,7 @@ async function downloadAtt(link, attId, fileName, itemId) {
   link.textContent = 'downloading...';
 
   try {
-    var res = await fetch('/api/attachment', {
+    var res = await fetch(apiAttachment, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({
@@ -267,7 +331,7 @@ async function refresh() {
   if (!pw) { errEl.textContent = 'Enter password'; errEl.style.display='block'; return; }
   errEl.style.display = 'none'; btn.disabled = true; btn.textContent = 'Refreshing...';
   try {
-    var res = await fetch('/api/items', {
+    var res = await fetch(apiItems, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({email: currentEmail, password: pw})
@@ -285,7 +349,21 @@ async function refresh() {
   }
 }
 
-function lock() { location.reload(); }
+async function lock() {
+  // Clear decrypted values immediately, even if the logout request fails.
+  document.getElementById('results').innerHTML = '';
+  window._allItems = [];
+  try {
+    await fetch(apiLock, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({session_token: sessionToken})
+    });
+  } finally {
+    sessionToken = '';
+    location.reload();
+  }
+}
 
 function esc(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -297,46 +375,62 @@ function esc(s) {
 
 @app.route('/')
 def index():
-    return render_template_string(INDEX)
+    return render_template_string(INDEX, vault_url=VAULT_URL)
 
 @app.route('/api/items', methods=['POST'])
 def api_items():
     cleanup_sessions()
-    data = request.get_json()
-    email = data.get('email', '').strip()
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'error': 'JSON object required'}), 400
+    email = data.get('email', '')
+    if isinstance(email, str):
+        email = email.strip()
     password = data.get('password', '')
 
-    if not email or not password:
+    if (not isinstance(email, str) or not isinstance(password, str)
+            or not email or email.startswith('-') or not password):
         return jsonify({'error': 'Email and master password required'}), 400
 
     home = tempfile.mkdtemp(prefix="bw_")
     env = bw_env(home)
+    keep_home = False
 
     try:
-        subprocess.run([BW_PATH, 'config', 'server', VAULT_URL],
-                       env=env, capture_output=True, timeout=10)
+        configured = subprocess.run(
+            [BW_PATH, 'config', 'server', VAULT_URL],
+            env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10
+        )
+        if configured.returncode != 0:
+            return jsonify({'error': 'Failed to configure vault server'}), 502
+        login_env = dict(env, BW_PASSWORD=password)
         result = subprocess.run(
-            [BW_PATH, 'login', email, password, '--raw'],
-            env=env, capture_output=True, text=True, timeout=30
+            [BW_PATH, 'login', email, '--passwordenv', 'BW_PASSWORD', '--raw'],
+            env=login_env, stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, timeout=30
         )
         if result.returncode != 0:
             err = result.stderr.strip() or 'Login failed'
             return jsonify({'error': err}), 401
 
         session_key = result.stdout.strip()
+        if not session_key:
+            return jsonify({'error': 'Empty CLI session key'}), 502
         env['BW_SESSION'] = session_key
 
         result = subprocess.run(
             [BW_PATH, 'list', 'items'],
-            env=env, capture_output=True, text=True, timeout=15
+            env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=15
         )
         if result.returncode != 0:
             return jsonify({'error': result.stderr.strip() or 'Failed to list items'}), 500
 
         items = json.loads(result.stdout)
+        if not isinstance(items, list):
+            return jsonify({'error': 'Invalid item list from vault'}), 502
         simplified = []
         for item in items:
-            login = item.get('login', {})
+            login = item.get('login') or {}
             uris = login.get('uris') or []
             uri = uris[0].get('uri', '') if uris else ''
 
@@ -361,9 +455,9 @@ def api_items():
         SESSIONS[token] = {
             'session_key': session_key,
             'bw_home': home,
-            'expires': time.time() + 600,
+            'expires': time.time() + SESSION_TTL,
         }
-
+        keep_home = True
         return jsonify({'items': simplified, 'session_token': token})
 
     except subprocess.TimeoutExpired:
@@ -372,84 +466,96 @@ def api_items():
         return jsonify({'error': 'Invalid response from vault'}), 500
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+    finally:
+        if not keep_home:
+            shutil.rmtree(home, ignore_errors=True)
 
 
 @app.route('/api/attachment', methods=['POST'])
 def api_attachment():
     cleanup_sessions()
-    data = request.get_json()
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'error': 'JSON object required'}), 400
     token = data.get('session_token', '')
     item_id = data.get('item_id', '')
     attachment_id = data.get('attachment_id', '')
-
-    if not token or token not in SESSIONS:
+    if not isinstance(token, str) or not token or token not in SESSIONS:
         return jsonify({'error': 'Session expired. Please refresh.'}), 401
+    if not all(isinstance(value, str) and value and not value.startswith('-')
+               for value in (item_id, attachment_id)):
+        return jsonify({'error': 'Item and attachment IDs required'}), 400
 
     session = SESSIONS[token]
     env = bw_env(session['bw_home'])
     env['BW_SESSION'] = session['session_key']
+    session['expires'] = time.time() + SESSION_TTL
 
-    # Refresh TTL
-    session['expires'] = time.time() + 600
-
-    out_dir = tempfile.mkdtemp(prefix="bw_att_")
-    try:
-        result = subprocess.run(
-            [BW_PATH, 'get', 'attachment', item_id, '--itemid', item_id,
-             '--output', out_dir],
-            env=env, capture_output=True, text=True, timeout=60
-        )
-        if result.returncode != 0:
-            return jsonify({'error': result.stderr.strip() or 'Failed to get attachment'}), 500
-
-        # bw outputs the file as the attachment's original filename in out_dir
-        files = os.listdir(out_dir)
-        if not files:
-            return jsonify({'error': 'No file output from bw'}), 500
-
-        filepath = os.path.join(out_dir, files[0])
-        filename = files[0]
-
-        mime, _ = mimetypes.guess_type(filename)
-        if not mime:
-            mime = 'application/octet-stream'
-
-        def generate():
-            with open(filepath, 'rb') as f:
-                while True:
-                    chunk = f.read(65536)
-                    if not chunk:
-                        break
-                    yield chunk
-            # Clean up after streaming
-            os.unlink(filepath)
-            os.rmdir(out_dir)
-
-        return Response(
-            generate(),
-            mimetype=mime,
-            headers={'Content-Disposition': f'attachment; filename="{filename}"'}
-        )
-
-    except subprocess.TimeoutExpired:
-        return jsonify({'error': 'Attachment download timed out'}), 504
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    # Read into a response buffer before deleting decrypted temporary files.
+    # This intentionally buffers an attachment in memory, as the browser already does.
+    with tempfile.TemporaryDirectory(prefix='bw_att_') as out_dir:
+        try:
+            result = subprocess.run(
+                [BW_PATH, 'get', 'attachment', attachment_id, '--itemid', item_id,
+                 '--output', out_dir + os.sep],
+                env=env, stdin=subprocess.DEVNULL,
+                capture_output=True, text=True, timeout=60
+            )
+            if result.returncode != 0:
+                return jsonify({'error': result.stderr.strip() or 'Failed to get attachment'}), 500
+            files = [name for name in os.listdir(out_dir)
+                     if os.path.isfile(os.path.join(out_dir, name))
+                     and not os.path.islink(os.path.join(out_dir, name))]
+            if len(files) != 1:
+                return jsonify({'error': 'Expected one attachment output from bw'}), 502
+            filename = files[0]
+            with open(os.path.join(out_dir, filename), 'rb') as f:
+                payload = BytesIO(f.read())
+            return send_file(payload, mimetype='application/octet-stream',
+                             as_attachment=True, download_name=filename)
+        except subprocess.TimeoutExpired:
+            return jsonify({'error': 'Attachment download timed out'}), 504
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
 
 
 @app.route('/api/lock', methods=['POST'])
 def api_lock():
-    data = request.get_json()
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'error': 'JSON object required'}), 400
     token = data.get('session_token', '')
-    if token in SESSIONS:
-        session = SESSIONS.pop(token)
+    if not isinstance(token, str):
+        return jsonify({'error': 'Session token must be a string'}), 400
+    session = SESSIONS.get(token)
+    if session:
         env = bw_env(session['bw_home'])
         env['BW_SESSION'] = session['session_key']
-        subprocess.run([BW_PATH, 'logout'], env=env, capture_output=True, timeout=5)
+        try:
+            subprocess.run([BW_PATH, 'logout'], env=env, stdin=subprocess.DEVNULL,
+                           capture_output=True, timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        finally:
+            discard_session(token)
     return jsonify({'ok': True})
 
 
+@app.after_request
+def prevent_secret_caching(response):
+    response.headers['Cache-Control'] = 'no-store'
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    return response
+
+
 if __name__ == '__main__':
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8090
-    print(f'VaultMini running on http://localhost:{port}')
-    app.run(host='127.0.0.1', port=port, debug=False)
+    try:
+        validate_runtime()
+        port = int(sys.argv[1]) if len(sys.argv) > 1 else int(os.environ.get('PORT', '8090'))
+        if not 1 <= port <= 65535:
+            raise ValueError('PORT must be between 1 and 65535')
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    host = os.environ.get('HOST', '127.0.0.1')
+    print(f'VaultMini running on http://{host}:{port}{BASE_PATH}/')
+    app.run(host=host, port=port, debug=False, threaded=False)
